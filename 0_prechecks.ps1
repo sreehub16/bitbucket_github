@@ -48,7 +48,6 @@ param(
     [string]$OutputPath = ""
 )
 
-Set-StrictMode -Off
 $ErrorActionPreference = "Stop"
 
 #region ── Environment validation ────────────────────────────────────────────
