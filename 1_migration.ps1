@@ -48,7 +48,7 @@
     Defaults to repo_migration_output-<timestamp>.csv
 
 .PARAMETER MaxConcurrent
-    Number of concurrent migration jobs. Must be between 1 and 5. Defaults to 3.
+    Number of concurrent migration jobs. Must be between 1 and 20. Defaults to 5.
 
 .EXAMPLE
     $env:BBS_BASE_URL         = "https://bitbucket.example.com"
@@ -65,7 +65,7 @@
     $env:SSH_USER                        = "git"
     $env:SSH_PRIVATE_KEY_PATH            = "C:\keys\id_rsa"
     $env:AZURE_STORAGE_CONNECTION_STRING = "DefaultEndpointsProtocol=https;AccountName=..."
-    .\1_migration.ps1 -CsvPath "C:\migrations\repos.csv" -MaxConcurrent 3
+    .\1_migration.ps1 -CsvPath "C:\migrations\repos.csv" -MaxConcurrent 5
 #>
 
 param(
@@ -76,7 +76,7 @@ param(
     [string]$OutputPath = "",
 
     [Parameter(Mandatory = $false)]
-    [int]$MaxConcurrent = 3
+    [int]$MaxConcurrent = 5
 )
 
 $ErrorActionPreference = "Stop"
@@ -90,8 +90,8 @@ function Write-VerboseLog {
 
 #region ── Parameter validation ──────────────────────────────────────────────
 
-if ($MaxConcurrent -gt 5) {
-    Write-Host "[ERROR] Maximum concurrent migrations ($MaxConcurrent) exceeds the allowed limit of 5." -ForegroundColor Red
+if ($MaxConcurrent -gt 20) {
+    Write-Host "[ERROR] Maximum concurrent migrations ($MaxConcurrent) exceeds the allowed limit of 20." -ForegroundColor Red
     exit 1
 }
 if ($MaxConcurrent -lt 1) {
@@ -350,6 +350,95 @@ $activeJobs = @{}
 $jobLogs    = @{}
 $jobLastLen = @{}
 
+$migrationJobScript = @'
+    param(
+        [string]$ProjectKey,   [string]$ProjectName, [string]$Repo,
+        [string]$GithubOrg,   [string]$GithubRepo,  [string]$Visibility,
+        [string]$LogFile,     [string]$BbsBaseUrl,
+        [string]$SshUser,     [string]$SshKeyPath,  [string]$SshKeyContent,
+        [string]$TargetApiUrl,[string[]]$StorageArgs,
+        [string]$BbsUsername, [string]$BbsPassword
+    )
+
+    # [START] is always the first log entry regardless of outcome
+    Add-Content -LiteralPath $LogFile -Value "[$([datetime]::Now)] [START] Migration: $ProjectKey/$Repo -> $GithubOrg/$GithubRepo (visibility: $Visibility)"
+
+    try {
+        # ── Resolve SSH key path ──────────────────────────────────────────────
+        $resolvedKey = $null
+        if ($SshKeyContent -and $SshKeyContent.Contains('BEGIN') -and $SshKeyContent.Contains('PRIVATE KEY')) {
+            $resolvedKey = Join-Path ([System.IO.Path]::GetTempPath()) ("bbs2gh_sshkey_$(Get-Date -Format 'yyyyMMdd-HHmmssfff').pem")
+            Set-Content -LiteralPath $resolvedKey -Value $SshKeyContent -NoNewline
+        } elseif ($SshKeyPath) {
+            $resolvedKey = $SshKeyPath
+        }
+
+        # ── Validate key ─────────────────────────────────────────────────────
+        if (-not $resolvedKey -or -not (Test-Path -LiteralPath $resolvedKey)) {
+            $keyDisplay = if ($resolvedKey) { $resolvedKey } else { '<empty>' }
+            Add-Content -LiteralPath $LogFile -Value "[$([datetime]::Now)] [ERROR] SSH private key path is invalid or missing: $keyDisplay"
+            "FAILED" | Set-Content -LiteralPath "$LogFile.result"
+            return
+        }
+
+        $keyEncrypted = $false
+        $keyTxt = Get-Content -LiteralPath $resolvedKey -Raw -ErrorAction SilentlyContinue
+        if ($keyTxt -match 'ENCRYPTED') { $keyEncrypted = $true }
+        if ($keyTxt -match 'BEGIN OPENSSH PRIVATE KEY' -and $keyTxt -match 'bcrypt') { $keyEncrypted = $true }
+
+        if ($keyEncrypted) {
+            Add-Content -LiteralPath $LogFile -Value "[$([datetime]::Now)] [ERROR] SSH private key is passphrase-protected. Use an unencrypted key or preload ssh-agent."
+            "FAILED" | Set-Content -LiteralPath "$LogFile.result"
+            return
+        }
+
+        # ── Run migration ─────────────────────────────────────────────────────
+        $env:BBS_USERNAME = $BbsUsername
+        $env:BBS_PASSWORD = $BbsPassword
+
+        $storagePrintable = $StorageArgs -join ' '
+        Add-Content -LiteralPath $LogFile -Value "[$([datetime]::Now)] [DEBUG] gh bbs2gh migrate-repo --bbs-server-url $BbsBaseUrl --bbs-project $ProjectKey --bbs-repo $Repo --github-org $GithubOrg --github-repo $GithubRepo $storagePrintable --ssh-user $SshUser --ssh-private-key $resolvedKey --target-api-url $TargetApiUrl --target-repo-visibility $Visibility"
+
+        $cmdArgs = @(
+            'bbs2gh', 'migrate-repo',
+            '--bbs-server-url',         $BbsBaseUrl,
+            '--bbs-project',            $ProjectKey,
+            '--bbs-repo',               $Repo,
+            '--github-org',             $GithubOrg,
+            '--github-repo',            $GithubRepo
+        ) + $StorageArgs + @(
+            '--ssh-user',               $SshUser,
+            '--ssh-private-key',        $resolvedKey,
+            '--target-api-url',         $TargetApiUrl,
+            '--target-repo-visibility', $Visibility
+        )
+
+        & gh @cmdArgs 2>&1 | Out-File -LiteralPath $LogFile -Append -Encoding UTF8
+
+        $logText = Get-Content -LiteralPath $LogFile -Raw -ErrorAction SilentlyContinue
+
+        if ($logText -match 'No operation will be performed') {
+            Add-Content -LiteralPath $LogFile -Value "[$([datetime]::Now)] [FAILED] No operation performed - repository may already exist or migration was skipped."
+            "FAILED" | Set-Content -LiteralPath "$LogFile.result"
+            return
+        }
+
+        if ($logText -notmatch 'State: SUCCEEDED') {
+            Add-Content -LiteralPath $LogFile -Value "[$([datetime]::Now)] [FAILED] Migration did not reach SUCCEEDED state."
+            "FAILED" | Set-Content -LiteralPath "$LogFile.result"
+            return
+        }
+
+        Add-Content -LiteralPath $LogFile -Value "[$([datetime]::Now)] [SUCCESS] Migration: $ProjectKey/$Repo -> $GithubOrg/$GithubRepo"
+        "SUCCESS" | Set-Content -LiteralPath "$LogFile.result"
+    }
+    catch {
+        Add-Content -LiteralPath $LogFile -Value "[$([datetime]::Now)] [ERROR] $($_.Exception.Message)"
+        "FAILED" | Set-Content -LiteralPath "$LogFile.result"
+    }
+'@
+$migrationJobBlock = [scriptblock]::Create($migrationJobScript)
+
 while ($queue.Count -gt 0 -or $activeJobs.Count -gt 0) {
 
     # ── Start new jobs up to MaxConcurrent ───────────────────────────────────
@@ -363,102 +452,7 @@ while ($queue.Count -gt 0 -or $activeJobs.Count -gt 0) {
             -TargetOrg $item.GithubOrg -TargetRepo $item.GithubRepo `
             -NewStatus "In Progress" -LogFile $logFile
 
-        $job = Start-Job -ScriptBlock {
-            param(
-                [string]$ProjectKey,   [string]$ProjectName, [string]$Repo,
-                [string]$GithubOrg,   [string]$GithubRepo,  [string]$Visibility,
-                [string]$LogFile,     [string]$BbsBaseUrl,
-                [string]$SshUser,     [string]$SshKeyPath,  [string]$SshKeyContent,
-                [string]$TargetApiUrl,[string[]]$StorageArgs,
-                [string]$BbsUsername, [string]$BbsPassword
-            )
-
-            function Add-LogEntry {
-                param([string]$Message)
-                Add-Content -LiteralPath $LogFile -Value "[$([datetime]::Now)] $Message"
-            }
-
-            function Get-ResolvedKeyPath {
-                param([string]$KeyContent, [string]$KeyFilePath)
-                if ($KeyContent -and $KeyContent.Contains('BEGIN') -and $KeyContent.Contains('PRIVATE KEY')) {
-                    $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("bbs2gh_sshkey_$(Get-Date -Format 'yyyyMMdd-HHmmssfff').pem")
-                    Set-Content -LiteralPath $tmp -Value $KeyContent -NoNewline
-                    return $tmp
-                }
-                elseif ($KeyFilePath) { return $KeyFilePath }
-                else { return $null }
-            }
-
-            function Test-KeyEncrypted {
-                param([string]$KeyPath)
-                if (-not (Test-Path -LiteralPath $KeyPath)) { return $false }
-                $txt = Get-Content -LiteralPath $KeyPath -Raw -ErrorAction SilentlyContinue
-                return ($txt -match 'ENCRYPTED') -or ($txt -match 'BEGIN OPENSSH PRIVATE KEY' -and $txt -match 'bcrypt')
-            }
-
-            try {
-                Add-LogEntry "[START] Migration: $ProjectKey/$Repo -> $GithubOrg/$GithubRepo (visibility: $Visibility)"
-
-                $resolvedKey = Get-ResolvedKeyPath -KeyContent $SshKeyContent -KeyFilePath $SshKeyPath
-
-                if (-not $resolvedKey -or -not (Test-Path -LiteralPath $resolvedKey)) {
-                    $keyDisplay = if ($resolvedKey) { $resolvedKey } else { '<empty>' }
-                    Add-LogEntry "[ERROR] SSH private key path is invalid or missing: $keyDisplay"
-                    "FAILED" | Set-Content -LiteralPath "$LogFile.result"
-                    return
-                }
-
-                if (Test-KeyEncrypted -KeyPath $resolvedKey) {
-                    Add-LogEntry "[ERROR] SSH private key is passphrase-protected. Use an unencrypted key or preload ssh-agent."
-                    "FAILED" | Set-Content -LiteralPath "$LogFile.result"
-                    return
-                }
-
-                $env:BBS_USERNAME = $BbsUsername
-                $env:BBS_PASSWORD = $BbsPassword
-
-                $storagePrintable = $StorageArgs -join ' '
-                Add-LogEntry "[DEBUG] gh bbs2gh migrate-repo --bbs-server-url $BbsBaseUrl --bbs-project $ProjectKey --bbs-repo $Repo --github-org $GithubOrg --github-repo $GithubRepo $storagePrintable --ssh-user $SshUser --ssh-private-key $resolvedKey --target-api-url $TargetApiUrl --target-repo-visibility $Visibility"
-
-                $cmdArgs = @(
-                    'bbs2gh', 'migrate-repo',
-                    '--bbs-server-url',        $BbsBaseUrl,
-                    '--bbs-project',           $ProjectKey,
-                    '--bbs-repo',              $Repo,
-                    '--github-org',            $GithubOrg,
-                    '--github-repo',           $GithubRepo
-                ) + $StorageArgs + @(
-                    '--ssh-user',              $SshUser,
-                    '--ssh-private-key',       $resolvedKey,
-                    '--target-api-url',        $TargetApiUrl,
-                    '--target-repo-visibility',$Visibility
-                )
-
-                & gh @cmdArgs 2>&1 | Out-File -LiteralPath $LogFile -Append -Encoding UTF8
-
-                $logText = Get-Content -LiteralPath $LogFile -Raw -ErrorAction SilentlyContinue
-
-                if ($logText -match 'No operation will be performed') {
-                    Add-LogEntry "[FAILED] No operation performed — repository may already exist or migration was skipped."
-                    "FAILED" | Set-Content -LiteralPath "$LogFile.result"
-                    return
-                }
-
-                if ($logText -notmatch 'State: SUCCEEDED') {
-                    Add-LogEntry "[FAILED] Migration did not reach SUCCEEDED state."
-                    "FAILED" | Set-Content -LiteralPath "$LogFile.result"
-                    return
-                }
-
-                Add-LogEntry "[SUCCESS] Migration: $ProjectKey/$Repo -> $GithubOrg/$GithubRepo"
-                "SUCCESS" | Set-Content -LiteralPath "$LogFile.result"
-            }
-            catch {
-                Add-Content -LiteralPath $LogFile -Value "[$([datetime]::Now)] [ERROR] $($_.Exception.Message)"
-                "FAILED" | Set-Content -LiteralPath "$LogFile.result"
-            }
-
-        } -ArgumentList `
+        $job = Start-Job -ScriptBlock $migrationJobBlock -ArgumentList `
             $item.ProjectKey, $item.ProjectName, $item.Repo,
             $item.GithubOrg,  $item.GithubRepo,  $item.Visibility,
             $logFile, $BBS_BASE_URL,
