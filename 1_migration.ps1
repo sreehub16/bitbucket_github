@@ -17,7 +17,7 @@
         $env:SSH_USER             = "your-ssh-username"
 
     SSH key (set one of the following):
-        $env:SSH_PRIVATE_KEY_PATH = "C:\keys\id_rsa"       # path to private key file
+        $env:SSH_PRIVATE_KEY_PATH = "C:\keys\id_rsa"       # full absolute path to private key file
         $env:SSH_PRIVATE_KEY      = "-----BEGIN RSA..."    # full private key content
 
     Storage — set ONE of the following before running:
@@ -155,6 +155,12 @@ if (-not $env:SSH_PRIVATE_KEY_PATH -and -not $env:SSH_PRIVATE_KEY) {
     exit 1
 }
 
+if ($env:SSH_PRIVATE_KEY_PATH -and -not (Test-Path -LiteralPath $env:SSH_PRIVATE_KEY_PATH)) {
+    Write-Host "[ERROR] SSH private key file not found: $($env:SSH_PRIVATE_KEY_PATH)" -ForegroundColor Red
+    Write-Host "        Ensure the full absolute path is correct and the file is accessible." -ForegroundColor Yellow
+    exit 1
+}
+
 $TARGET_API_URL = if ($env:TARGET_API_URL) { $env:TARGET_API_URL } else { "https://api.github.com" }
 Write-VerboseLog "Using TARGET_API_URL=$TARGET_API_URL"
 
@@ -201,7 +207,7 @@ function Get-StorageArgs {
 
     if ($hasAzure) {
         Write-VerboseLog "Storage backend: Azure Blob"
-        return @()
+        return , @()
     }
 
     Write-VerboseLog "Storage backend: GitHub-owned storage"
